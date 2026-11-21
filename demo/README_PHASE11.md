@@ -1,4 +1,4 @@
-# Phase 11: PostgreSQL persistence (work in progress)
+# Phase 11: PostgreSQL persistence (synthetic development)
 
 This is an opt-in synthetic single-user development mode. It is not authenticated, not a secure audit system, and not approved for confidential or production data. The Phase 10 memory-only mode remains the default.
 
@@ -33,7 +33,7 @@ The isolated QA exercise created a PostgreSQL custom-format `pg_dump`, copied it
 
 ## Current acceptance status
 
-Integration tests cover repeated migrations, database-backed English/Arabic records, concurrent decisions, invalid approval, stale revision and application-process restart. Local isolated QA verified an application-plus-database restart, a safe HTTP 503 while the QA database was stopped and recovery afterward, and a host-saved dump restored into a separate QA database with the quotation and review revision replayed by the application. These manual checks used synthetic data. Further review of migration/security limitations and a successful GitHub Actions run for the final commit are still needed before Phase 11 can be called complete.
+Integration tests cover repeated migrations, database-backed English/Arabic records, concurrent decisions, invalid approval, stale revision and application-process restart. Local isolated QA verified an application-plus-database restart, a safe HTTP 503 while the QA database was stopped and recovery afterward, and a host-saved dump restored into a separate QA database with the quotation and review revision replayed by the application. These manual checks used synthetic data. The merged main commit [`823565f`](https://github.com/zenithdevelopers7-source/nawa-document-intelligence/commit/823565f7c44c15b07719b91670fe8bbfb8d96521) passed [synthetic demo and PostgreSQL CI](https://github.com/zenithdevelopers7-source/nawa-document-intelligence/actions/runs/43840038065) and [Docker smoke CI](https://github.com/zenithdevelopers7-source/nawa-document-intelligence/actions/runs/43840038120). These results are evidence for the synthetic development scope, not an independent security audit or production-readiness approval. Authentication, source-file persistence, operational backups, access controls and production migration planning remain open.
 
 The `/api/ready` endpoint checks access to the configured storage and is used by the Docker health check. This is a basic readiness check, not a full data-integrity or backup verification.
 
