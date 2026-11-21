@@ -2,7 +2,7 @@
 import unittest
 from pathlib import Path
 from nawa_demo.grounded_qa import ask
-from nawa_demo.retrieval import BM25Index, read_corpus
+from nawa_demo.retrieval import BM25Index, Passage, read_corpus
 
 CORPUS = Path(__file__).resolve().parents[1] / 'samples/retrieval/passages.json'
 
@@ -38,6 +38,50 @@ class GroundedQATests(unittest.TestCase):
         self.assertEqual(r['status'], 'insufficient_evidence')
         self.assertIsNone(r['answer'])
         self.assertEqual(r['citations'], [])
+
+    def test_missing_payment_date_abstains_despite_partial_overlap(self):
+        for question in ('VAT payment due date', 'reviewer VAT payment', 'reviewer VAT deadline',
+                         'موعد دفع الضريبة', 'شركة المثال موعد دفع الضريبة', 'شركة المثال دفع الضريبة'):
+            with self.subTest(question=question):
+                result = ask(self.idx(), question)
+                self.assertEqual(result['status'], 'insufficient_evidence')
+                self.assertIsNone(result['answer'])
+                self.assertEqual(result['citations'], [])
+
+    def test_lower_threshold_is_an_explicit_less_conservative_override(self):
+        result = ask(self.idx(), 'reviewer VAT payment', min_coverage=0.60)
+        self.assertEqual(result['status'], 'answered')
+        self.assertNotIn('payment', result['answer'].casefold())
+
+    def test_explicit_absence_phrases_abstain_with_positive_controls(self):
+        examples = [
+            ('Reviewer VAT deadline is not specified.', 'reviewer VAT deadline', 'insufficient_evidence'),
+            ('Reviewer VAT deadline is NOT PROVIDED.', 'reviewer VAT deadline', 'insufficient_evidence'),
+            ('No reviewer VAT deadline specified.', 'reviewer VAT deadline', 'insufficient_evidence'),
+            ('موعد دفع الضريبة غير محدد.', 'موعد دفع الضريبة', 'insufficient_evidence'),
+            ('موعد دفع الضريبة لم يتم تحديد.', 'موعد دفع الضريبة', 'insufficient_evidence'),
+            ('Reviewer VAT deadline 2026-12-01.', 'reviewer VAT deadline', 'answered'),
+            ('موعد دفع الضريبة ٢٠٢٦ ١٢ ٠١.', 'موعد دفع الضريبة', 'answered'),
+        ]
+        for text, question, status in examples:
+            with self.subTest(text=text):
+                passage = Passage.from_dict({'passage_id':'fixture','document_id':'doc','version':'1',
+                    'tenant_id':'t','page':1,'text':text,'allowed_principals':['p'],
+                    'source':'synthetic.txt','method':'synthetic'})
+                result = ask(BM25Index([passage], tenant_id='t', principal_id='p'), question)
+                self.assertEqual(result['status'], status)
+                if status == 'insufficient_evidence':
+                    self.assertIsNone(result['answer'])
+                    self.assertEqual(result['citations'], [])
+
+    def test_unknown_absence_word_remains_an_open_semantic_limit(self):
+        passage = Passage.from_dict({'passage_id':'unknown','document_id':'doc','version':'1',
+            'tenant_id':'t','page':1,'text':'Reviewer VAT deadline remains unknown.',
+            'allowed_principals':['p'],'source':'synthetic.txt','method':'synthetic'})
+        result = ask(BM25Index([passage], tenant_id='t', principal_id='p'), 'reviewer VAT deadline')
+        # This records an open limitation; it is not a safety success.
+        self.assertEqual(result['status'], 'answered')
+        self.assertIn('unknown', result['answer'])
 
     def test_unauthorized_information_not_exposed(self):
         r = ask(self.idx(), 'Falcon Robotics confidential inspection')

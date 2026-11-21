@@ -115,7 +115,7 @@ def validate_generated(payload: dict, hits: list[dict]) -> list[dict] | None:
 
 
 def ask_rag(index: BM25Index, question: str, *, provider: RAGProvider | None = None,
-            top_k: int = 5, min_coverage: float = 0.60) -> dict:
+            top_k: int = 5, min_coverage: float = 1.0) -> dict:
     """Answer only with verified citations after Phase 5 lexical eligibility.
 
     Provider called ONLY after filtering, retrieval and grounding eligibility.

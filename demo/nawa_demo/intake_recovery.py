@@ -26,6 +26,12 @@ def inspect_storage(store, jobs):
                 store.read_verified(document_id, digest)
             except (OSError, ValueError):
                 corrupt.append(document_id)
+    # Also report unreferenced entries with valid-looking IDs when they are
+    # directories, symlinks or other non-regular files. They are not safe
+    # orphaned files and must not disappear from the inventory.
+    unsafe.extend(name for name, path in files.items()
+                  if _ID.fullmatch(name) and name not in references
+                  and (path.is_symlink() or not path.is_file()))
     return {
         'orphaned_files': sorted(name for name, path in files.items()
                                  if _ID.fullmatch(name) and name not in references

@@ -14,6 +14,7 @@ except ImportError:
     psycopg = None
 
 from nawa_demo.authorization import Principal
+from nawa_demo.identity_repository import membership_by_key
 from nawa_demo.intake_postgres import PostgresIntakeJobs
 from nawa_demo.intake_scoped import ScopedIntake
 from nawa_demo.intake_store import LocalIntakeStore
@@ -39,13 +40,16 @@ class Phase13DatabaseSnapshotTests(unittest.TestCase):
         self.other = 'qa-' + uuid4().hex
         self.issuer, self.subject = 'https://synthetic.invalid', uuid4().hex
         key = json.dumps([self.issuer,self.subject], separators=(',', ':'))
-        self.principal = Principal(key, self.tenant, 'analyst')
         self.connect = lambda: psycopg.connect(DSN)
         with self.connect() as conn:
             conn.execute('INSERT INTO nawa_tenants (id) VALUES (%s),(%s)', (self.tenant,self.other))
             conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (self.issuer,self.subject))
             conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                          (self.issuer,self.subject,self.tenant,'analyst'))
+        with self.connect() as conn:
+            self.principal = membership_by_key(conn, identity_key=key, tenant=self.tenant)
+        if self.principal is None:
+            raise AssertionError('Synthetic analyst membership unavailable')
         self.temp = TemporaryDirectory(prefix='nawa14-synthetic-')
         self.addCleanup(self.temp.cleanup)
         self.store = LocalIntakeStore(self.temp.name)
@@ -174,7 +178,10 @@ class Phase13DatabaseSnapshotTests(unittest.TestCase):
         with self.connect() as conn:
             conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                          (self.issuer,self.subject,self.other,'analyst'))
-        other_principal = Principal(self.principal.subject,self.other,'analyst')
+        with self.connect() as conn:
+            other_principal = membership_by_key(conn, identity_key=self.principal.subject, tenant=self.other)
+        if other_principal is None:
+            raise AssertionError('Synthetic other-tenant membership unavailable')
         other_intake = ScopedIntake(self.connect,self.store)
         other_content = (DEMO/'samples'/'pdf'/'incorrect_vat.pdf').read_bytes()
         other_document, created = other_intake.submit(other_principal,'incorrect_vat.pdf',other_content)
@@ -348,4 +355,5 @@ class Phase13DatabaseSnapshotTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

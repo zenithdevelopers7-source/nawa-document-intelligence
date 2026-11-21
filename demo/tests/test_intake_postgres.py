@@ -46,8 +46,150 @@ from nawa_demo.scoped_state import ScopedState
 DSN = os.environ.get('NAWA_PHASE13_TEST_DSN')
 
 
+def make_principal(connect, identity_key, tenant, role):
+    # Integration fixtures must use the same server-resolved generation as a
+    # real authenticated session, rather than inventing a Principal locally.
+    with connect() as conn:
+        result = membership_by_key(conn, identity_key=identity_key, tenant=tenant)
+    if result is None or result.role != role:
+        raise AssertionError('Synthetic membership fixture unavailable')
+    return result
+
+
 @unittest.skipUnless(DSN and psycopg, 'isolated PostgreSQL test not configured')
 class PostgresIntakeTests(unittest.TestCase):
+    def test_synthetic_stale_restore_can_revive_unobserved_session_until_restart(self):
+        """Characterize an open recovery risk, not a production safety gate."""
+        from nawa_demo.session_draft import SessionError
+        from nawa_demo.synthetic_recovery_coordinator import prepare_recovery
+        params = psycopg.conninfo.conninfo_to_dict(DSN)
+        if (params.get('host') != '127.0.0.1' or 'hostaddr' in params
+                or not params.get('dbname', '').startswith('nawa_phase13_qa_')):
+            raise ValueError('Disposable localhost QA database required')
+        issuer, subject = 'https://synthetic-restore', uuid4().hex
+        identity = json.dumps([issuer, subject], separators=(',', ':'))
+        with self.connect() as conn:
+            conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
+            conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                         (issuer, subject, self.tenant, 'analyst'))
+        active_connection = [self.connect]
+        def lookup(key, tenant):
+            with active_connection[0]() as conn:
+                return membership_by_key(conn, identity_key=key, tenant=tenant)
+        sessions = SessionStore(lookup)
+        other_sessions = SessionStore(lookup)
+        old = sessions.issue(identity, self.tenant)['session']
+        other_old = other_sessions.issue(identity, self.tenant)['session']
+        control = sessions.issue(identity, self.tenant)['session']
+        restore_name = 'nawa_phase13_qa_restore_' + uuid4().hex[:12]
+        pg_bin = Path(r'C:\Program Files\PostgreSQL\18\bin')
+        def pg_tool(name):
+            return shutil.which(name) or str(pg_bin / (name + '.exe'))
+        common = ['-h', params['host'], '-p', params.get('port', '5432'), '-U', params['user']]
+        env = os.environ.copy()
+        env['PGPASSWORD'] = params.get('password', '')
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        created_names = []
+        try:
+            with TemporaryDirectory() as folder:
+                dump = Path(folder) / 'synthetic-stale.dump'
+                subprocess.run([pg_tool('pg_dump'), *common, '-Fc', '-f', str(dump), params['dbname']],
+                               check=True, capture_output=True, env=env, creationflags=flags)
+                with self.connect() as conn:
+                    conn.execute('UPDATE nawa_memberships SET active=false WHERE issuer=%s AND subject=%s', (issuer, subject))
+                    conn.execute('UPDATE nawa_memberships SET active=true WHERE issuer=%s AND subject=%s', (issuer, subject))
+                with self.assertRaises(SessionError):
+                    sessions.authorize_current(control, 'view')
+                with psycopg.connect(DSN, autocommit=True) as admin:
+                    admin.execute(psycopg.sql.SQL('CREATE DATABASE {}').format(psycopg.sql.Identifier(restore_name)))
+                created_names.append(restore_name)
+                subprocess.run([pg_tool('pg_restore'), *common, '-d', restore_name, '--no-owner', str(dump)],
+                               check=True, capture_output=True, env=env, creationflags=flags)
+                restored = dict(params, dbname=restore_name)
+                active_connection[0] = lambda: psycopg.connect(**restored)
+                # The old snapshot lacks the later change. This illustrates the
+                # unresolved replay risk; it is not an acceptable safety claim.
+                self.assertEqual(sessions.authorize_current(old, 'view').role, 'analyst')
+                self.assertEqual(other_sessions.authorize_current(other_old, 'view').role, 'analyst')
+                # Model a second restore after pausing the first process.
+                active_connection[0] = self.connect
+                sessions.begin_recovery()
+                active_connection[0] = lambda: psycopg.connect(**restored)
+                with self.assertRaises(SessionError):
+                    sessions.authorize_current(old, 'view')
+                with self.assertRaises(SessionError):
+                    sessions.issue(identity, self.tenant)
+                # Pausing one process does not pause another process.
+                self.assertEqual(other_sessions.authorize_current(other_old, 'view').role, 'analyst')
+                other_sessions.begin_recovery()
+                with self.assertRaises(SessionError):
+                    other_sessions.authorize_current(other_old, 'view')
+                sessions.end_recovery()
+                other_sessions.end_recovery()
+                with self.assertRaises(SessionError):
+                    sessions.authorize_current(old, 'view')
+                with self.assertRaises(SessionError):
+                    other_sessions.authorize_current(other_old, 'view')
+                restarted = SessionStore(lookup)
+                with self.assertRaises(SessionError):
+                    restarted.authorize_current(old, 'view')
+                fresh = restarted.issue(identity, self.tenant)['session']
+                self.assertEqual(restarted.authorize_current(fresh, 'view').role, 'analyst')
+                # Exercise coordinator ordering against a second newly restored
+                # disposable database. Quiesce/drain are test callbacks, not a
+                # real traffic or in-flight request barrier.
+                active_connection[0] = self.connect
+                prior_tokens = [store.issue(identity, self.tenant)['session'] for store in (sessions, other_sessions)]
+                coordinated_name = 'nawa_phase13_qa_restore_' + uuid4().hex[:12]
+                with psycopg.connect(DSN, autocommit=True) as admin:
+                    admin.execute(psycopg.sql.SQL('CREATE DATABASE {}').format(psycopg.sql.Identifier(coordinated_name)))
+                created_names.append(coordinated_name)
+                coordinated = dict(params, dbname=coordinated_name)
+                def restore():
+                    subprocess.run([pg_tool('pg_restore'), *common, '-d', coordinated_name, '--no-owner', str(dump)],
+                                   check=True, capture_output=True, env=env, creationflags=flags)
+                    active_connection[0] = lambda: psycopg.connect(**coordinated)
+                    return True
+                def verify():
+                    with active_connection[0]() as conn:
+                        return membership_by_key(conn, identity_key=identity, tenant=self.tenant) is not None
+                outcome = prepare_recovery([sessions, other_sessions], quiesce=lambda:True, drain=lambda:True,
+                                           restore=restore, verify=verify)
+                self.assertEqual(outcome, {'status':'ready_for_manual_resume', 'completed_pause_calls':2})
+                for store, token in zip((sessions, other_sessions), prior_tokens):
+                    with self.assertRaises(SessionError):
+                        store.authorize_current(token, 'view')
+                    with self.assertRaises(SessionError):
+                        store.issue(identity, self.tenant)
+                    store.end_recovery()
+                    with self.assertRaises(SessionError):
+                        store.authorize_current(token, 'view')
+                    new = store.issue(identity, self.tenant)['session']
+                    self.assertEqual(store.authorize_current(new, 'view').role, 'analyst')
+        finally:
+            with psycopg.connect(DSN, autocommit=True) as admin:
+                for name in created_names:
+                    admin.execute(psycopg.sql.SQL('DROP DATABASE {}').format(psycopg.sql.Identifier(name)))
+
+    def test_old_principal_rejected_after_unobserved_membership_cycle(self):
+        issuer, subject = 'https://synthetic-issuer', uuid4().hex
+        identity_key = json.dumps([issuer, subject], separators=(',', ':'))
+        with self.connect() as conn:
+            conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
+            conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                         (issuer, subject, self.tenant, 'analyst'))
+        old = make_principal(self.connect, identity_key, self.tenant, 'analyst')
+        with TemporaryDirectory() as folder:
+            service = ScopedIntake(self.connect, LocalIntakeStore(folder))
+            self.assertEqual(service.list_documents(old), [])
+            with self.connect() as conn:
+                conn.execute('UPDATE nawa_memberships SET active=false WHERE issuer=%s AND subject=%s', (issuer, subject))
+                conn.execute('UPDATE nawa_memberships SET active=true WHERE issuer=%s AND subject=%s', (issuer, subject))
+            with self.assertRaises(PermissionError):
+                service.list_documents(old)
+            fresh = make_principal(self.connect, identity_key, self.tenant, 'analyst')
+            self.assertEqual(service.list_documents(fresh), [])
+
     def setUp(self):
         self.tenant = 'synthetic-' + uuid4().hex
         self.other = 'synthetic-' + uuid4().hex
@@ -181,8 +323,8 @@ class PostgresIntakeTests(unittest.TestCase):
                          (issuer, subject, self.tenant, 'analyst'))
             conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                          (issuer, subject, self.other, 'viewer'))
-        analyst = Principal(identity_key, self.tenant, 'analyst')
-        viewer = Principal(identity_key, self.other, 'viewer')
+        analyst = make_principal(self.connect, identity_key, self.tenant, 'analyst')
+        viewer = make_principal(self.connect, identity_key, self.other, 'viewer')
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             service = ScopedIntake(self.connect, store)
@@ -229,7 +371,7 @@ class PostgresIntakeTests(unittest.TestCase):
             conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
             conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                          (issuer, subject, self.tenant, 'analyst'))
-        analyst = Principal(identity_key, self.tenant, 'analyst')
+        analyst = make_principal(self.connect, identity_key, self.tenant, 'analyst')
         suffix = uuid4().hex
         function, trigger = 'nawa_test_failure_' + suffix, 'nawa_test_trigger_' + suffix
         with TemporaryDirectory() as folder:
@@ -267,6 +409,292 @@ class PostgresIntakeTests(unittest.TestCase):
             self.assertEqual(self.jobs.result(self.tenant, document)['total'], '945.00')
             self.assertIsNone(self.jobs.result(self.other, document))
 
+    def test_synthetic_retrieval_uses_approved_latest_verified_tenant_source(self):
+        from nawa_demo.synthetic_live_retrieval import EvidenceUnavailable, SyntheticLiveRetrieval
+        from nawa_demo.synthetic_postgres_passages import SyntheticPostgresPassages
+        from nawa_demo.synthetic_postgres_review_queue import SyntheticPostgresReviewQueue
+        from nawa_demo.synthetic_review_queue import ReviewRequestUnavailable
+        issuer = 'https://synthetic-retrieval'
+        users = [(uuid4().hex, self.tenant), (uuid4().hex, self.other)]
+        reviewer_users = [(uuid4().hex, self.tenant), (uuid4().hex, self.other)]
+        viewer_subject = uuid4().hex
+        with self.connect() as conn:
+            for subject, tenant in users:
+                conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
+                conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                             (issuer, subject, tenant, 'analyst'))
+            for subject, tenant in reviewer_users:
+                conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
+                conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                             (issuer, subject, tenant, 'reviewer'))
+            conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, viewer_subject))
+            conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                         (issuer, viewer_subject, self.tenant, 'viewer'))
+        keys = [json.dumps([issuer, subject], separators=(',', ':')) for subject, _ in users]
+        reviewer_keys = [json.dumps([issuer, subject], separators=(',', ':')) for subject, _ in reviewer_users]
+        viewer_key = json.dumps([issuer, viewer_subject], separators=(',', ':'))
+        principals = [make_principal(self.connect, key, tenant, 'analyst')
+                      for key, (_, tenant) in zip(keys, users)]
+        reviewers = [make_principal(self.connect, key, tenant, 'reviewer')
+                     for key, (_, tenant) in zip(reviewer_keys, reviewer_users)]
+        with TemporaryDirectory() as folder:
+            store = LocalIntakeStore(folder)
+            intake = ScopedIntake(self.connect, store)
+            review = ScopedState(self.connect)
+            source = SyntheticPostgresPassages(self.connect, store)
+            retrieval = SyntheticLiveRetrieval(source.principal, source.passages)
+            sample = (Path(__file__).resolve().parents[1] / 'samples/english_quote.txt').read_bytes()
+            families = [uuid4().hex, uuid4().hex]
+            def create(index, suffix, expected):
+                principal = principals[index]
+                data = sample + ('\n# synthetic-' + suffix + '\n').encode()
+                document, _ = intake.submit(principal, suffix + '.txt', data)
+                intake.link_version(principal, document, families[index], expected_previous=expected)
+                self.assertEqual(process_one(self.jobs, store, principal.tenant), 'completed')
+                quote = intake.promote(principal, document)['id']
+                review.review_start(principal, quote)
+                return document, quote
+            def approve(index, quote):
+                review.review_decision(reviewers[index], {'id':quote, 'decision':'approve', 'reason':'synthetic review',
+                                                  'expected_revision':1})
+            first, first_quote = create(0, 'first', 0)
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total'), [])
+            approve(0, first_quote)
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total'), [])
+            with self.assertRaises(ValueError):
+                source.set_access(principals[0], first, keys[0], True, 'analyst cannot grant')
+            self.assertTrue(source.set_access(reviewers[0], first, keys[0], True, 'synthetic grant'))
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total')[0]['document_id'], first)
+            other, other_quote = create(1, 'other', 0)
+            approve(1, other_quote)
+            self.assertTrue(source.set_access(reviewers[1], other, keys[1], True, 'synthetic grant'))
+            self.assertEqual(retrieval.search(keys[1], self.other, 'Grand Total')[0]['document_id'], other)
+            self.assertEqual(retrieval.search(viewer_key, self.tenant, 'Grand Total'), [])
+            with self.assertRaises(ValueError):
+                source.set_access(reviewers[0], other, keys[0], True, 'cross tenant')
+            with self.assertRaises(ValueError):
+                source.set_access(reviewers[0], first, keys[1], True, 'cross tenant target')
+            self.assertTrue(source.set_access(reviewers[0], first, viewer_key, True, 'viewer grant'))
+            self.assertEqual(retrieval.search(viewer_key, self.tenant, 'Grand Total')[0]['document_id'], first)
+            self.assertTrue(source.set_access(reviewers[0], first, viewer_key, False, 'viewer revocation'))
+            self.assertFalse(source.set_access(reviewers[0], first, viewer_key, False, 'duplicate revocation'))
+            self.assertEqual(retrieval.search(viewer_key, self.tenant, 'Grand Total'), [])
+            with self.assertRaises(EvidenceUnavailable):
+                retrieval.resolve(viewer_key, self.tenant, first + ':v1')
+            with self.assertRaises(EvidenceUnavailable):
+                retrieval.resolve(keys[1], self.other, first + ':v1')
+            second, second_quote = create(0, 'second', 1)
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total'), [])
+            with self.assertRaises(EvidenceUnavailable):
+                retrieval.resolve(keys[0], self.tenant, first + ':v1')
+            approve(0, second_quote)
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total'), [])
+            self.assertTrue(source.set_access(reviewers[0], second, keys[0], True, 'second version grant'))
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total')[0]['document_id'], second)
+            calls = []
+            def changed_grant(principal):
+                calls.append(1)
+                if len(calls) == 2:
+                    self.assertTrue(source.set_access(reviewers[0], second, keys[0], False, 'synthetic revoke'))
+                    self.assertTrue(source.set_access(reviewers[0], second, keys[0], True, 'synthetic regrant'))
+                return source.passages(principal)
+            changing_retrieval = SyntheticLiveRetrieval(source.principal, changed_grant)
+            with self.assertRaises(EvidenceUnavailable):
+                changing_retrieval.search(keys[0], self.tenant, 'Grand Total')
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total')[0]['document_id'], second)
+            # Characterize restoring a backup taken before a grant revocation.
+            # The target is a new disposable database, never the source DB.
+            params = psycopg.conninfo.conninfo_to_dict(DSN)
+            if (params.get('host') != '127.0.0.1' or 'hostaddr' in params
+                    or not params.get('dbname', '').startswith('nawa_phase13_qa_')):
+                raise ValueError('Disposable localhost QA database required')
+            restored_name = 'nawa_phase13_qa_restore_' + uuid4().hex[:12]
+            pg_bin = Path(r'C:\Program Files\PostgreSQL\18\bin')
+            def pg_tool(name):
+                return shutil.which(name) or str(pg_bin / (name + '.exe'))
+            common = ['-h', params['host'], '-p', params.get('port', '5432'), '-U', params['user']]
+            pg_env = os.environ.copy()
+            pg_env['PGPASSWORD'] = params.get('password', '')
+            flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            created_restore = False
+            try:
+                with TemporaryDirectory() as backup_dir:
+                    dump = Path(backup_dir) / 'synthetic-grants.dump'
+                    subprocess.run([pg_tool('pg_dump'), *common, '-Fc', '-f', str(dump), params['dbname']],
+                                   check=True, capture_output=True, env=pg_env, creationflags=flags)
+                    self.assertTrue(source.set_access(reviewers[0], second, keys[0], False, 'before restore'))
+                    self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total'), [])
+                    with psycopg.connect(DSN, autocommit=True) as admin:
+                        admin.execute(psycopg.sql.SQL('CREATE DATABASE {}').format(psycopg.sql.Identifier(restored_name)))
+                    created_restore = True
+                    subprocess.run([pg_tool('pg_restore'), *common, '-d', restored_name, '--no-owner', str(dump)],
+                                   check=True, capture_output=True, env=pg_env, creationflags=flags)
+                    restored_params = dict(params, dbname=restored_name)
+                    restored_connect = lambda: psycopg.connect(**restored_params)
+                    restored_source = SyntheticPostgresPassages(restored_connect, store)
+                    restored_search = SyntheticLiveRetrieval(restored_source.principal, restored_source.passages)
+                    # Risk characterization: this old backup reintroduces access
+                    # that was revoked later; it is not a recovery safety pass.
+                    self.assertEqual(restored_search.search(keys[0], self.tenant, 'Grand Total')[0]['document_id'], second)
+                    # An explicit QA-only reset on the separate restored target
+                    # denies all restored grants until individually regranted.
+                    with restored_connect() as conn:
+                        reset = conn.execute('UPDATE nawa_synthetic_document_grants SET active=false WHERE active')
+                        self.assertGreaterEqual(reset.rowcount, 1)
+                    self.assertEqual(restored_search.search(keys[0], self.tenant, 'Grand Total'), [])
+                    self.assertEqual(restored_search.search(keys[1], self.other, 'Grand Total'), [])
+                    self.assertTrue(restored_source.set_access(reviewers[0], second, keys[0], True, 'synthetic reapproval'))
+                    self.assertEqual(restored_search.search(keys[0], self.tenant, 'Grand Total')[0]['document_id'], second)
+                    self.assertEqual(restored_search.search(keys[1], self.other, 'Grand Total'), [])
+                    self.assertTrue(source.set_access(reviewers[0], second, keys[0], True, 'restore test cleanup'))
+            finally:
+                if created_restore:
+                    with psycopg.connect(DSN, autocommit=True) as admin:
+                        admin.execute(psycopg.sql.SQL('DROP DATABASE {}').format(psycopg.sql.Identifier(restored_name)))
+            http_sessions = SessionStore(source.principal)
+            owner_token = http_sessions.issue(keys[0], self.tenant)
+            viewer_token = http_sessions.issue(viewer_key, self.tenant)
+            other_token = http_sessions.issue(keys[1], self.other)
+            reviewer_token = http_sessions.issue(reviewer_keys[0], self.tenant)
+            queue = SyntheticPostgresReviewQueue(retrieval, self.connect)
+            handler = make_protected_handler(None, http_sessions, DashboardState(), synthetic_retrieval=retrieval,
+                                             synthetic_review_queue=queue)
+            http_server = HTTPServer(('127.0.0.1', 0), handler)
+            http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+            http_thread.start()
+            base = 'http://127.0.0.1:%s' % http_server.server_port
+            def evidence_request(path, payload, token=None):
+                headers = {'Origin':'http://127.0.0.1:8765', 'Content-Type':'application/json'}
+                if token:
+                    headers.update({'Cookie':'nawa_session=' + token['session'], 'X-NAWA-CSRF':token['csrf']})
+                try:
+                    with urlopen(Request(base + path, data=json.dumps(payload).encode(), headers=headers), timeout=5) as response:
+                        return response.status, json.load(response)
+                except HTTPError as error:
+                    with error:
+                        return error.code, json.load(error)
+            search = '/api/synthetic-evidence/search'
+            source_path = '/api/synthetic-evidence/source'
+            review_path = '/api/synthetic-evidence/review'
+            query, identifier = {'q':'Grand Total'}, {'id':second + ':v2'}
+            try:
+                self.assertEqual(evidence_request(search, query)[0], 403)
+                self.assertEqual(evidence_request(search, query, owner_token)[1]['passages'][0]['document_id'], second)
+                self.assertEqual(evidence_request(source_path, identifier, owner_token)[1]['passage']['document_id'], second)
+                handoff = evidence_request(review_path, query, owner_token)[1]
+                self.assertEqual((handoff['status'], handoff['answer'], handoff['citations']),
+                                 ('requires_human_review', None, []))
+                self.assertEqual(handoff['evidence'][0]['document_id'], second)
+                self.assertEqual(evidence_request(search, query, viewer_token)[1]['passages'], [])
+                self.assertEqual(evidence_request(review_path, query, viewer_token)[1]['evidence'], [])
+                self.assertEqual(evidence_request(source_path, identifier, viewer_token)[0], 503)
+                self.assertEqual(evidence_request(source_path, identifier, other_token)[0], 503)
+                task_request = {'request_key':uuid4().hex, 'question':'Review synthetic evidence',
+                                'passage_id':second + ':v2'}
+                created = evidence_request('/api/synthetic-review/create', task_request, owner_token)
+                self.assertEqual((created[0],created[1]['status'],created[1]['created']), (200,'pending_review',True))
+                task_id = created[1]['id']
+                retry = evidence_request('/api/synthetic-review/create', task_request, owner_token)
+                self.assertEqual((retry[1]['id'],retry[1]['created']), (task_id,False))
+                fresh = SyntheticPostgresReviewQueue(retrieval, self.connect)
+                self.assertEqual(fresh.get(principals[0], task_id)['question'], 'Review synthetic evidence')
+                with self.assertRaises(ReviewRequestUnavailable):
+                    fresh.create(principals[0], task_request['request_key'], 'Different question', second + ':v2')
+                with self.connect() as conn:
+                    saved = conn.execute('SELECT question,evidence FROM nawa_synthetic_review_requests WHERE id=%s',
+                                         (task_id,)).fetchone()
+                self.assertEqual(saved[0], 'Review synthetic evidence')
+                self.assertNotIn('untrusted_source_text', saved[1])
+                child_code = '''
+import os, sys, psycopg
+from nawa_demo.intake_store import LocalIntakeStore
+from nawa_demo.synthetic_postgres_passages import SyntheticPostgresPassages
+from nawa_demo.synthetic_live_retrieval import SyntheticLiveRetrieval
+from nawa_demo.synthetic_postgres_review_queue import SyntheticPostgresReviewQueue
+dsn = os.environ['NAWA_PHASE13_TEST_DSN']
+params = psycopg.conninfo.conninfo_to_dict(dsn)
+assert params.get('host') == '127.0.0.1' and 'hostaddr' not in params
+assert params.get('dbname', '').startswith('nawa_phase13_qa_')
+def connect(): return psycopg.connect(dsn)
+source = SyntheticPostgresPassages(connect, LocalIntakeStore(sys.argv[4]))
+retrieval = SyntheticLiveRetrieval(source.principal, source.passages)
+task = SyntheticPostgresReviewQueue(retrieval, connect).get(source.principal(sys.argv[2], sys.argv[1]), sys.argv[3])
+assert task['status'] == 'pending_review' and task['question'] == 'Review synthetic evidence'
+print('Synthetic request found in a fresh process')
+'''
+                child = subprocess.run([sys.executable, '-c', child_code, self.tenant, keys[0], task_id, folder],
+                                       capture_output=True, text=True, timeout=30)
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertIn('Synthetic request found', child.stdout)
+                concurrent_key = uuid4().hex
+                with ThreadPoolExecutor(max_workers=4) as workers:
+                    results = list(workers.map(lambda _: fresh.create(principals[0], concurrent_key,
+                                   'Concurrent synthetic review', second + ':v2'), range(4)))
+                self.assertEqual(len({item['id'] for item in results}), 1)
+                self.assertEqual(sum(item['created'] for item in results), 1)
+                self.assertEqual(evidence_request('/api/synthetic-review/show', {'id':task_id}, reviewer_token)[0], 400)
+                self.assertTrue(source.set_access(reviewers[0], second, reviewer_keys[0], True, 'reviewer access'))
+                self.assertEqual(evidence_request('/api/synthetic-review/show', {'id':task_id}, reviewer_token)[0], 200)
+                self.assertTrue(source.set_access(reviewers[0], second, reviewer_keys[0], False, 'reviewer access revoked'))
+                self.assertEqual(evidence_request('/api/synthetic-review/show', {'id':task_id}, reviewer_token)[0], 400)
+                self.assertEqual(evidence_request('/api/synthetic-review/show', {'id':task_id}, other_token)[0], 400)
+                self.assertTrue(source.set_access(reviewers[0], second, viewer_key, True, 'http grant'))
+                self.assertEqual(evidence_request(source_path, identifier, viewer_token)[0], 200)
+                self.assertEqual(evidence_request(review_path, query, viewer_token)[1]['evidence'][0]['document_id'], second)
+                self.assertTrue(source.set_access(reviewers[0], second, viewer_key, False, 'http revoke'))
+                self.assertEqual(evidence_request(source_path, identifier, viewer_token)[0], 503)
+                self.assertEqual(evidence_request(review_path, query, viewer_token)[1]['evidence'], [])
+            finally:
+                http_server.shutdown()
+                http_server.server_close()
+                http_thread.join(5)
+            with self.connect() as conn:
+                conn.execute('UPDATE nawa_memberships SET active=false WHERE issuer=%s AND subject=%s AND tenant_id=%s',
+                             (issuer, users[0][0], self.tenant))
+                conn.execute('UPDATE nawa_memberships SET active=true WHERE issuer=%s AND subject=%s AND tenant_id=%s',
+                             (issuer, users[0][0], self.tenant))
+            principals[0] = make_principal(self.connect, keys[0], self.tenant, 'analyst')
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total'), [])
+            self.assertTrue(source.set_access(reviewers[0], second, keys[0], True, 'regrant after reactivation'))
+            original_second = (Path(folder) / second).read_bytes()
+            (Path(folder) / second).write_bytes(b'tampered')
+            with self.assertRaises(EvidenceUnavailable):
+                retrieval.search(keys[0], self.tenant, 'Grand Total')
+            with self.assertRaises(ReviewRequestUnavailable):
+                queue.get(principals[0], task_id)
+            self.assertEqual(retrieval.search(keys[1], self.other, 'Grand Total')[0]['document_id'], other)
+            (Path(folder) / second).write_bytes(original_second)
+            with self.assertRaises(ValueError):
+                source.withdraw(principals[0], second, 'synthetic withdrawal')
+            reviewer = reviewers[0]
+            with self.assertRaises(ValueError):
+                source.withdraw(reviewer, other, 'other tenant source')
+            self.assertTrue(source.withdraw(reviewer, second, 'synthetic withdrawal'))
+            with self.assertRaises(ReviewRequestUnavailable):
+                queue.get(principals[0], task_id)
+            self.assertFalse(source.withdraw(reviewer, second, 'repeated withdrawal'))
+            self.assertEqual(retrieval.search(keys[0], self.tenant, 'Grand Total'), [])
+            with self.assertRaises(EvidenceUnavailable):
+                retrieval.resolve(keys[0], self.tenant, second + ':v2')
+            # A withdrawn newest version must not revive the approved older one.
+            with self.assertRaises(EvidenceUnavailable):
+                retrieval.resolve(keys[0], self.tenant, first + ':v1')
+            self.assertEqual(retrieval.search(keys[1], self.other, 'Grand Total')[0]['document_id'], other)
+            with self.connect() as conn:
+                withdrawn = conn.execute('''SELECT actor_hash,reason FROM nawa_synthetic_withdrawals
+                    WHERE tenant_id=%s AND document_id=%s''', (self.tenant, second)).fetchone()
+            self.assertEqual(withdrawn, (hashlib.sha256(reviewer_keys[0].encode()).hexdigest(), 'synthetic withdrawal'))
+            with self.connect() as conn:
+                events = conn.execute('''SELECT action,reason FROM nawa_synthetic_document_grant_events
+                    WHERE tenant_id=%s AND document_id=%s AND subject_hash=%s ORDER BY id''',
+                    (self.tenant, first, hashlib.sha256(viewer_key.encode()).hexdigest())).fetchall()
+            self.assertEqual(events, [('grant', 'viewer grant'), ('revoke', 'viewer revocation')])
+            with self.connect() as conn:
+                conn.execute('UPDATE nawa_memberships SET active=false WHERE issuer=%s AND subject=%s AND tenant_id=%s',
+                             (issuer, users[0][0], self.tenant))
+            with self.assertRaises(EvidenceUnavailable):
+                retrieval.search(keys[0], self.tenant, 'Grand Total')
+
     def test_scoped_access_rechecks_roles_tenant_and_revocation(self):
         issuer, subject = 'https://synthetic-issuer', uuid4().hex
         identity_key = json.dumps([issuer, subject], separators=(',', ':'))
@@ -276,8 +704,8 @@ class PostgresIntakeTests(unittest.TestCase):
                          (issuer, subject, self.tenant, 'analyst'))
             conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                          (issuer, subject, self.other, 'viewer'))
-        analyst = Principal(identity_key, self.tenant, 'analyst')
-        viewer = Principal(identity_key, self.other, 'viewer')
+        analyst = make_principal(self.connect, identity_key, self.tenant, 'analyst')
+        viewer = make_principal(self.connect, identity_key, self.other, 'viewer')
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             service = ScopedIntake(self.connect, store)
@@ -334,7 +762,7 @@ class PostgresIntakeTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             service = ScopedIntake(uncertain_connection, store)
-            principal = Principal(identity_key, self.tenant, 'analyst')
+            principal = make_principal(self.connect, identity_key, self.tenant, 'analyst')
             with self.assertRaisesRegex(RuntimeError, 'after commit'):
                 service.submit(principal, 'x.txt', b'synthetic')
             stored = list(Path(folder).iterdir())
@@ -352,7 +780,7 @@ class PostgresIntakeTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             service = ScopedIntake(self.connect, store)
-            principal = Principal(identity_key, self.tenant, 'analyst')
+            principal = make_principal(self.connect, identity_key, self.tenant, 'analyst')
             content = (Path(__file__).resolve().parents[1] / 'samples/english_quote.txt').read_bytes()
             document, _ = service.submit(principal, 'english.txt', content)
             self.assertEqual(process_one(self.jobs, store, self.tenant), 'completed')
@@ -375,7 +803,7 @@ class PostgresIntakeTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             service = ScopedIntake(self.connect, store)
-            principal = Principal(identity_key, self.tenant, 'analyst')
+            principal = make_principal(self.connect, identity_key, self.tenant, 'analyst')
             first = None
             for index in range(MAX_DOCUMENTS_PER_TENANT - 1):
                 document, _ = service.submit(principal, f'{index}.txt', f'synthetic-{index}'.encode())
@@ -406,7 +834,7 @@ class PostgresIntakeTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             service = ScopedIntake(self.connect, store)
-            principal = Principal(identity_key, self.tenant, 'analyst')
+            principal = make_principal(self.connect, identity_key, self.tenant, 'analyst')
             first, _ = service.submit(principal, 'one.txt', b'A' * MAX_DOCUMENT_BYTES)
             service.submit(principal, 'two.txt', b'B' * MAX_DOCUMENT_BYTES)
             service.submit(principal, 'three.txt', b'C' * MAX_DOCUMENT_BYTES)
@@ -437,7 +865,7 @@ class PostgresIntakeTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             service = ScopedIntake(self.connect, store)
-            principal = Principal(identity_key, self.tenant, 'analyst')
+            principal = make_principal(self.connect, identity_key, self.tenant, 'analyst')
             content = (Path(__file__).resolve().parents[1] / 'samples/english_quote.txt').read_bytes()
             document, _ = service.submit(principal, 'english.txt', content)
             self.assertEqual(process_one(self.jobs, store, self.tenant), 'completed')
@@ -476,7 +904,7 @@ class PostgresIntakeTests(unittest.TestCase):
             conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
             conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                          (issuer, subject, self.tenant, 'analyst'))
-        principal = Principal(identity_key, self.tenant, 'analyst')
+        principal = make_principal(self.connect, identity_key, self.tenant, 'analyst')
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             compatible = ScopedIntake(self.connect, store)
@@ -521,8 +949,8 @@ class PostgresIntakeTests(unittest.TestCase):
                 conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
                 conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                              (issuer, subject, self.tenant, role))
-        analyst = Principal(json.dumps([issuer, analyst_subject], separators=(',', ':')), self.tenant, 'analyst')
-        reviewer = Principal(json.dumps([issuer, reviewer_subject], separators=(',', ':')), self.tenant, 'reviewer')
+        analyst = make_principal(self.connect, json.dumps([issuer, analyst_subject], separators=(',', ':')), self.tenant, 'analyst')
+        reviewer = make_principal(self.connect, json.dumps([issuer, reviewer_subject], separators=(',', ':')), self.tenant, 'reviewer')
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             intake = ScopedIntake(self.connect, store)
@@ -568,8 +996,8 @@ class PostgresIntakeTests(unittest.TestCase):
                 conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
                 conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                              (issuer, subject, self.tenant, role))
-        analyst = Principal(json.dumps([issuer, analyst_subject], separators=(',', ':')), self.tenant, 'analyst')
-        reviewer = Principal(json.dumps([issuer, reviewer_subject], separators=(',', ':')), self.tenant, 'reviewer')
+        analyst = make_principal(self.connect, json.dumps([issuer, analyst_subject], separators=(',', ':')), self.tenant, 'analyst')
+        reviewer = make_principal(self.connect, json.dumps([issuer, reviewer_subject], separators=(',', ':')), self.tenant, 'reviewer')
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             intake = ScopedIntake(self.connect, store)
@@ -609,8 +1037,8 @@ class PostgresIntakeTests(unittest.TestCase):
                 conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
                 conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                              (issuer, subject, self.tenant, role))
-        analyst = Principal(json.dumps([issuer, analyst_subject], separators=(',', ':')), self.tenant, 'analyst')
-        reviewer = Principal(json.dumps([issuer, reviewer_subject], separators=(',', ':')), self.tenant, 'reviewer')
+        analyst = make_principal(self.connect, json.dumps([issuer, analyst_subject], separators=(',', ':')), self.tenant, 'analyst')
+        reviewer = make_principal(self.connect, json.dumps([issuer, reviewer_subject], separators=(',', ':')), self.tenant, 'reviewer')
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             intake = ScopedIntake(self.connect, store)
@@ -643,8 +1071,8 @@ class PostgresIntakeTests(unittest.TestCase):
                 conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
                 conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                              (issuer, subject, self.tenant, role))
-        analyst = Principal(json.dumps([issuer, analyst_subject], separators=(',', ':')), self.tenant, 'analyst')
-        reviewer = Principal(json.dumps([issuer, reviewer_subject], separators=(',', ':')), self.tenant, 'reviewer')
+        analyst = make_principal(self.connect, json.dumps([issuer, analyst_subject], separators=(',', ':')), self.tenant, 'analyst')
+        reviewer = make_principal(self.connect, json.dumps([issuer, reviewer_subject], separators=(',', ':')), self.tenant, 'reviewer')
         pdf = pymupdf.open()
         pdf.new_page().insert_text((50, 60), 'Synthetic cover')
         page = pdf.new_page()
@@ -691,7 +1119,7 @@ class PostgresIntakeTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             service = ScopedIntake(self.connect, store)
-            principal = Principal(identity_key, self.tenant, 'analyst')
+            principal = make_principal(self.connect, identity_key, self.tenant, 'analyst')
             content = (Path(__file__).resolve().parents[1] / 'samples/english_quote.txt').read_bytes()
             document, _ = service.submit(principal, 'english.txt', content)
             self.assertEqual(process_one(self.jobs, store, self.tenant), 'completed')
@@ -789,7 +1217,7 @@ class PostgresIntakeTests(unittest.TestCase):
             conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
             conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                          (issuer, subject, self.tenant, 'analyst'))
-        principal = Principal(identity_key, self.tenant, 'analyst')
+        principal = make_principal(self.connect, identity_key, self.tenant, 'analyst')
         with TemporaryDirectory() as folder:
             service = build_synthetic_intake(self.connect, str(Path(folder).resolve()))
             content = (Path(__file__).resolve().parents[1] / 'samples/english_quote.txt').read_bytes()
@@ -823,7 +1251,7 @@ class PostgresIntakeTests(unittest.TestCase):
                 conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer,subject))
                 conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
                              (issuer,subject,self.tenant,role))
-        principal = lambda role: Principal(json.dumps([issuer,subjects[role]], separators=(',',':')), self.tenant, role)
+        principal = lambda role: make_principal(self.connect, json.dumps([issuer,subjects[role]], separators=(',',':')), self.tenant, role)
         with TemporaryDirectory() as folder:
             root = Path(folder)
             store = LocalIntakeStore(root / 'source')
@@ -886,8 +1314,12 @@ class PostgresIntakeTests(unittest.TestCase):
             apply_intake_migrations(conn)
             apply_intake_migrations(conn)
             verify_intake_migrations(conn)
-            self.assertEqual(conn.execute('SELECT count(*) FROM nawa_intake_schema_migrations').fetchone()[0], 3)
+            self.assertEqual(conn.execute('SELECT count(*) FROM nawa_intake_schema_migrations').fetchone()[0], 7)
             self.assertIsNotNone(conn.execute("SELECT to_regclass('nawa_intake_versions')").fetchone()[0])
+            self.assertIsNotNone(conn.execute("SELECT to_regclass('nawa_synthetic_withdrawals')").fetchone()[0])
+            self.assertIsNotNone(conn.execute("SELECT to_regclass('nawa_synthetic_document_grants')").fetchone()[0])
+            self.assertIsNotNone(conn.execute("SELECT to_regclass('nawa_synthetic_grant_generation_seq')").fetchone()[0])
+            self.assertIsNotNone(conn.execute("SELECT to_regclass('nawa_synthetic_review_requests')").fetchone()[0])
             conn.execute("UPDATE nawa_intake_schema_migrations SET checksum='altered'")
             conn.commit()
             with self.assertRaisesRegex(ValueError, 'history mismatch'):
@@ -904,7 +1336,7 @@ class PostgresIntakeTests(unittest.TestCase):
         connect = lambda: psycopg.connect(**params)
         issuer, tenant = 'https://synthetic-upgrade', 'tenant-upgrade'
         subjects = {'analyst':uuid4().hex, 'reviewer':uuid4().hex}
-        principal = lambda role: Principal(json.dumps([issuer,subjects[role]], separators=(',',':')), tenant, role)
+        principal = lambda role: make_principal(connect, json.dumps([issuer,subjects[role]], separators=(',',':')), tenant, role)
         with TemporaryDirectory() as folder:
             root = Path(folder)
             old_migrations = root / 'old-migrations'
@@ -1001,8 +1433,8 @@ class PostgresIntakeTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             store = LocalIntakeStore(folder)
             content = (Path(__file__).resolve().parents[1] / 'samples/english_quote.txt').read_bytes() + b'\n# qa-test\n'
-            analyst = Principal(json.dumps(['https://snapshot','snapshot-analyst'], separators=(',',':')), 'tenant-a', 'analyst')
-            reviewer = Principal(json.dumps(['https://snapshot','snapshot-reviewer'], separators=(',',':')), 'tenant-a', 'reviewer')
+            analyst = make_principal(self.connect, json.dumps(['https://snapshot','snapshot-analyst'], separators=(',',':')), 'tenant-a', 'analyst')
+            reviewer = make_principal(self.connect, json.dumps(['https://snapshot','snapshot-reviewer'], separators=(',',':')), 'tenant-a', 'reviewer')
             intake = ScopedIntake(self.connect, store)
             doc, _ = intake.submit(analyst, 'synthetic.txt', content)
             self.assertEqual(process_one(self.jobs, store, 'tenant-a'), 'completed')
@@ -1017,3 +1449,4 @@ class PostgresIntakeTests(unittest.TestCase):
             (Path(folder) / doc).write_bytes(b'changed')
             with self.assertRaises(ValueError):
                 snapshot(self.connect, folder)
+

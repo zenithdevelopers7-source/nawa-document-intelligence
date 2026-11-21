@@ -23,9 +23,12 @@ def inspect_history(connection):
         cur.execute("""SELECT to_regclass('nawa_intake_schema_migrations'),
             to_regclass('nawa_intake_documents'), to_regclass('nawa_intake_jobs'),
             to_regclass('nawa_intake_versions'), to_regclass('nawa_intake_promotions'),
-            to_regclass('nawa_intake_admin_events')""")
+            to_regclass('nawa_intake_admin_events'), to_regclass('nawa_synthetic_withdrawals'),
+            to_regclass('nawa_synthetic_document_grants'), to_regclass('nawa_synthetic_document_grant_events'),
+            to_regclass('nawa_synthetic_grant_generation_seq'), to_regclass('nawa_synthetic_review_requests')""")
         row = cur.fetchone()
-        presence = dict(zip(('history','documents','jobs','versions','promotions','admin_events'),
+        presence = dict(zip(('history','documents','jobs','versions','promotions','admin_events','withdrawals',
+                             'document_grants','document_grant_events','grant_generation_sequence','review_requests'),
                             (value is not None for value in row)))
         if not presence['history']:
             records = {}
@@ -64,4 +67,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

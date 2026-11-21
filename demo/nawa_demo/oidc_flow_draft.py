@@ -65,9 +65,12 @@ class OidcFlow:
             principal = self.resolve_membership(identity['issuer'], identity['subject'])
             if principal is None:
                 raise LoginError('Sign-in could not be completed')
-            remaining = int(identity['expires_at'] - time.time())
+            # Anchor the verified token's remaining lifetime before issuance.
+            # Issuance performs another membership lookup, which may be slow.
+            started = self.sessions.clock()
+            remaining = identity['expires_at'] - time.time()
             if remaining < 1:
                 raise LoginError('Sign-in could not be completed')
-            return self.sessions.issue(principal.subject, principal.tenant, max_age=remaining)
+            return self.sessions.issue(principal.subject, principal.tenant, deadline=started + remaining)
         except Exception:
             raise LoginError('Sign-in could not be completed') from None

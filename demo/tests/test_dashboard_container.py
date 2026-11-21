@@ -9,6 +9,13 @@ from nawa_demo import dashboard_container
 
 
 class DockerEntrypointTests(unittest.TestCase):
+    def test_synthetic_evidence_requires_disposable_ci_stack(self):
+        with patch.dict(os.environ, {'NAWA_SYNTHETIC_EVIDENCE':'ci'}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'disposable CI'):
+                dashboard_container.serve()
+        with patch.dict(os.environ, {'NAWA_SYNTHETIC_EVIDENCE':'unexpected'}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'Invalid synthetic evidence'):
+                dashboard_container.serve()
     @patch('nawa_demo.dashboard_container.HTTPServer')
     def test_configurable_test_port_and_invalid_port(self, http_cls):
         with patch.dict(os.environ, {'NAWA_BIND_PORT':'8766'}, clear=True):

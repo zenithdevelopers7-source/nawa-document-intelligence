@@ -6,6 +6,16 @@ from nawa_demo.oidc_attempts import LoginAttempts, InvalidLoginAttempt
 
 
 class LoginAttemptTests(unittest.TestCase):
+    def test_invalid_attempt_limits_are_rejected(self):
+        for ttl in (float('nan'), float('inf'), 0, -1, True, '300'):
+            with self.subTest(ttl=ttl), self.assertRaises(ValueError):
+                LoginAttempts(ttl=ttl)
+        for limit in (float('nan'), float('inf'), 0, -1, True, 1.5, '128'):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                LoginAttempts(limit=limit)
+        with self.assertRaises(ValueError):
+            LoginAttempts(clock=None)
+
     def test_pkce_and_one_time_use(self):
         attempts = LoginAttempts()
         started = attempts.create()

@@ -65,6 +65,18 @@ class OidcFlowDraftTests(unittest.TestCase):
         with self.assertRaises(LoginError):
             self.flow.begin()
 
+    def test_token_expiring_during_session_lookup_denies_login(self):
+        clock = [100]
+        def slow_lookup(subject, tenant):
+            clock[0] += 301
+            return self.principal
+        self.flow.sessions = SessionStore(slow_lookup, clock=lambda: clock[0])
+        start = self.flow.begin()
+        params = parse_qs(urlparse(start['authorization_url']).query)
+        self.provider.nonce = params['nonce'][0]
+        with self.assertRaises(LoginError):
+            self.flow.callback(state=params['state'][0], state_cookie=start['state_cookie'], code='synthetic-code')
+
     def test_nonce_and_membership_denied(self):
         start = self.flow.begin()
         params = parse_qs(urlparse(start['authorization_url']).query)

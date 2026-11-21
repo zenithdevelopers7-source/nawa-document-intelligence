@@ -1,0 +1,11 @@
+[
+  {"id":"en_total","language":"en","tenant_id":"demo-a","principal_id":"reviewer-a","query":"Example English Supplies 1050","relevant_ids":["en-quote-v1-p1"],"forbidden_ids":["restricted-v1-p1","other-tenant-v1-p1"],"expect_no_result":false},
+  {"id":"ar_total","language":"ar","tenant_id":"demo-a","principal_id":"reviewer-a","query":"شركة المثال الضريبة ٤٥","relevant_ids":["ar-quote-v1-p1"],"forbidden_ids":["restricted-v1-p1","other-tenant-v1-p1"],"expect_no_result":false},
+  {"id":"mixed_policy","language":"mixed","tenant_id":"demo-a","principal_id":"reviewer-a","query":"reviewer VAT evidence الضريبة","relevant_ids":["policy-v1-p2"],"forbidden_ids":["restricted-v1-p1","other-tenant-v1-p1"],"expect_no_result":false},
+  {"id":"no_match_en","language":"en","tenant_id":"demo-a","principal_id":"reviewer-a","query":"interplanetary antimatter quantum","relevant_ids":[],"forbidden_ids":[],"expect_no_result":true},
+  {"id":"missing_date_en","language":"en","tenant_id":"demo-a","principal_id":"reviewer-a","query":"VAT payment due date","relevant_ids":[],"forbidden_ids":[],"expect_no_result":true},
+  {"id":"missing_date_ar","language":"ar","tenant_id":"demo-a","principal_id":"reviewer-a","query":"موعد دفع الضريبة","relevant_ids":[],"forbidden_ids":[],"expect_no_result":true},
+  {"id":"restricted_supplier","language":"en","tenant_id":"demo-a","principal_id":"reviewer-a","query":"Falcon Robotics inspection","relevant_ids":[],"forbidden_ids":["restricted-v1-p1"],"expect_no_result":true},
+  {"id":"other_tenant","language":"en","tenant_id":"demo-a","principal_id":"reviewer-a","query":"Orion satellite equipment","relevant_ids":[],"forbidden_ids":["other-tenant-v1-p1"],"expect_no_result":true},
+  {"id":"other_tenant_control","language":"en","tenant_id":"demo-b","principal_id":"reviewer-a","query":"Orion satellite equipment","relevant_ids":["other-tenant-v1-p1"],"forbidden_ids":["en-quote-v1-p1","ar-quote-v1-p1"],"expect_no_result":false}
+]

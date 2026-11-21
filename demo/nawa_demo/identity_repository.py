@@ -7,7 +7,7 @@ def membership(connection, *, issuer, subject, tenant, lock=False):
     if not all(isinstance(x, str) and x.strip() for x in (issuer, subject, tenant)):
         return None
     with connection.cursor() as cursor:
-        query = '''SELECT m.role FROM nawa_memberships m
+        query = '''SELECT m.role, m.membership_generation, i.identity_generation, t.tenant_generation FROM nawa_memberships m
             JOIN nawa_identities i ON i.issuer = m.issuer AND i.subject = m.subject
             JOIN nawa_tenants t ON t.id = m.tenant_id
             WHERE m.issuer = %s AND m.subject = %s AND m.tenant_id = %s
@@ -21,7 +21,8 @@ def membership(connection, *, issuer, subject, tenant, lock=False):
     # The server-side session uses an unambiguous identity key. It must not be
     # accepted from the browser or logged as a credential.
     pair = json.dumps([issuer, subject], ensure_ascii=False, separators=(',', ':')).encode('utf-8')
-    return Principal(pair.decode('utf-8'), tenant, row[0])
+    return Principal(pair.decode('utf-8'), tenant, row[0], membership_generation=row[1],
+                     identity_generation=row[2], tenant_generation=row[3])
 
 
 def membership_by_key(connection, *, identity_key, tenant, lock=False):
@@ -33,3 +34,4 @@ def membership_by_key(connection, *, identity_key, tenant, lock=False):
     if not isinstance(pair, list) or len(pair) != 2 or not all(isinstance(x, str) for x in pair):
         return None
     return membership(connection, issuer=pair[0], subject=pair[1], tenant=tenant, lock=lock)
+

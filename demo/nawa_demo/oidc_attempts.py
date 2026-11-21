@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import secrets
 import threading
 import time
@@ -22,7 +23,8 @@ def _digest(value):
 
 class LoginAttempts:
     def __init__(self, *, ttl=300, limit=128, clock=time.monotonic):
-        if ttl <= 0 or limit <= 0:
+        if (type(ttl) not in (int, float) or not math.isfinite(ttl) or ttl <= 0
+                or type(limit) is not int or limit <= 0 or not callable(clock)):
             raise ValueError('Invalid login-attempt limits')
         self.ttl, self.limit, self.clock = ttl, limit, clock
         self._attempts = {}

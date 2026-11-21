@@ -49,6 +49,8 @@ services:
       NAWA_STORAGE: postgres
       NAWA_AUTH: oidc
       NAWA_INTAKE: synthetic
+      NAWA_SYNTHETIC_EVIDENCE: ${NAWA_SYNTHETIC_EVIDENCE:-off}
+      GITHUB_ACTIONS: ${GITHUB_ACTIONS:-false}
       NAWA_SYNTHETIC_ORIGIN_POLICY: require_recorded
       NAWA_SYNTHETIC_CORRECTION_SOURCE: require_intake_text_layer
       NAWA_INTAKE_DIR: /intake
@@ -85,6 +87,8 @@ services:
       NAWA_STORAGE: postgres
       NAWA_AUTH: oidc
       NAWA_INTAKE: synthetic
+      NAWA_SYNTHETIC_EVIDENCE: ${NAWA_SYNTHETIC_EVIDENCE:-off}
+      GITHUB_ACTIONS: ${GITHUB_ACTIONS:-false}
       NAWA_SYNTHETIC_ORIGIN_POLICY: require_recorded
       NAWA_SYNTHETIC_CORRECTION_SOURCE: require_intake_text_layer
       NAWA_INTAKE_DIR: /intake

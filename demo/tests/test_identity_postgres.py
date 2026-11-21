@@ -73,6 +73,122 @@ class IdentityPostgresTests(unittest.TestCase):
         with self.connect() as conn:
             self.assertIsNone(membership(conn, issuer='https://issuer.example', subject='person-1', tenant='tenant-a'))
 
+    def test_membership_generation_rejects_unobserved_changes_and_reinsert(self):
+        from nawa_demo.migrate import migrate
+        from nawa_demo.identity_repository import membership, membership_by_key
+        from nawa_demo.session_draft import SessionError, SessionStore
+        issuer, subject, tenant = 'https://issuer.example/realm', 'synthetic-user', 'tenant-a'
+        with self.connect() as conn:
+            migrate(conn)
+            conn.execute('INSERT INTO nawa_tenants (id) VALUES (%s)', (tenant,))
+            conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', (issuer, subject))
+            conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                         (issuer, subject, tenant, 'analyst'))
+            principal = membership(conn, issuer=issuer, subject=subject, tenant=tenant)
+        def lookup(key, tenant_id):
+            with self.connect() as conn:
+                return membership_by_key(conn, identity_key=key, tenant=tenant_id)
+        sessions = SessionStore(lookup)
+        old = sessions.issue(principal.subject, tenant)['session']
+        with self.connect() as conn:
+            conn.execute('UPDATE nawa_memberships SET active=false WHERE issuer=%s AND subject=%s', (issuer, subject))
+            conn.execute('UPDATE nawa_memberships SET active=true WHERE issuer=%s AND subject=%s', (issuer, subject))
+        # No protected request happened between deactivation and reactivation.
+        with self.assertRaises(SessionError):
+            sessions.authorize_current(old, 'view')
+        fresh = sessions.issue(principal.subject, tenant)['session']
+        self.assertEqual(sessions.authorize_current(fresh, 'view').role, 'analyst')
+        with self.connect() as conn:
+            conn.execute('DELETE FROM nawa_memberships WHERE issuer=%s AND subject=%s', (issuer, subject))
+            conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                         (issuer, subject, tenant, 'analyst'))
+        with self.assertRaises(SessionError):
+            sessions.authorize_current(fresh, 'view')
+        current = sessions.issue(principal.subject, tenant)['session']
+        with self.connect() as conn:
+            conn.execute("UPDATE nawa_memberships SET role='reviewer' WHERE issuer=%s AND subject=%s", (issuer, subject))
+            conn.execute("UPDATE nawa_memberships SET role='analyst' WHERE issuer=%s AND subject=%s", (issuer, subject))
+        with self.assertRaises(SessionError):
+            sessions.authorize_current(current, 'view')
+        identity_session = sessions.issue(principal.subject, tenant)['session']
+        with self.connect() as conn:
+            conn.execute('UPDATE nawa_identities SET active=false WHERE issuer=%s AND subject=%s', (issuer, subject))
+            conn.execute('UPDATE nawa_identities SET active=true WHERE issuer=%s AND subject=%s', (issuer, subject))
+        with self.assertRaises(SessionError):
+            sessions.authorize_current(identity_session, 'view')
+        tenant_session = sessions.issue(principal.subject, tenant)['session']
+        with self.connect() as conn:
+            conn.execute('UPDATE nawa_tenants SET active=false WHERE id=%s', (tenant,))
+            conn.execute('UPDATE nawa_tenants SET active=true WHERE id=%s', (tenant,))
+        with self.assertRaises(SessionError):
+            sessions.authorize_current(tenant_session, 'view')
+        fresh = sessions.issue(principal.subject, tenant)['session']
+        self.assertEqual(sessions.authorize_current(fresh, 'view').role, 'analyst')
+
+    def test_generation_migration_preserves_existing_membership(self):
+        from pathlib import Path
+        import shutil
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+        from nawa_demo.migrate import migrate
+        migrations = Path(__file__).resolve().parents[1] / 'nawa_demo' / 'migrations'
+        with TemporaryDirectory() as directory:
+            prior = Path(directory)
+            for path in sorted(migrations.glob('00[1-4]_*.sql')):
+                shutil.copy2(path, prior / path.name)
+            with self.connect() as conn:
+                with patch('nawa_demo.migrate.MIGRATIONS', prior):
+                    migrate(conn)
+                conn.execute('INSERT INTO nawa_tenants (id) VALUES (%s)', ('tenant-a',))
+                conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', ('https://issuer.example', 'old-user'))
+                conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                             ('https://issuer.example', 'old-user', 'tenant-a', 'reviewer'))
+                before = dict(conn.execute('SELECT name,checksum FROM nawa_schema_migrations').fetchall())
+            with self.connect() as conn:
+                migrate(conn)
+                migrate(conn)
+                row = conn.execute('SELECT role,active,membership_generation FROM nawa_memberships WHERE subject=%s',
+                                   ('old-user',)).fetchone()
+                after = dict(conn.execute('SELECT name,checksum FROM nawa_schema_migrations').fetchall())
+            self.assertEqual(row[:2], ('reviewer', True))
+            self.assertGreater(row[2], 0)
+            self.assertEqual({name:after[name] for name in before}, before)
+            self.assertIn('005_membership_generation.sql', after)
+            self.assertIn('006_identity_tenant_generation.sql', after)
+
+    def test_identity_tenant_generation_upgrade_preserves_existing_generations(self):
+        from pathlib import Path
+        import shutil
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+        from nawa_demo.migrate import migrate
+        migrations = Path(__file__).resolve().parents[1] / 'nawa_demo' / 'migrations'
+        with TemporaryDirectory() as directory:
+            prior = Path(directory)
+            for path in sorted(migrations.glob('00[1-5]_*.sql')):
+                shutil.copy2(path, prior / path.name)
+            with self.connect() as conn:
+                with patch('nawa_demo.migrate.MIGRATIONS', prior):
+                    migrate(conn)
+                conn.execute('INSERT INTO nawa_tenants (id) VALUES (%s)', ('tenant-a',))
+                conn.execute('INSERT INTO nawa_identities (issuer,subject) VALUES (%s,%s)', ('https://issuer.example', 'old-user'))
+                conn.execute('INSERT INTO nawa_memberships (issuer,subject,tenant_id,role) VALUES (%s,%s,%s,%s)',
+                             ('https://issuer.example', 'old-user', 'tenant-a', 'reviewer'))
+                generation = conn.execute('SELECT membership_generation FROM nawa_memberships WHERE subject=%s', ('old-user',)).fetchone()[0]
+                before = dict(conn.execute('SELECT name,checksum FROM nawa_schema_migrations').fetchall())
+            with self.connect() as conn:
+                migrate(conn)
+                migrate(conn)
+                row = conn.execute('''SELECT m.role,m.active,m.membership_generation,i.identity_generation,t.tenant_generation
+                    FROM nawa_memberships m JOIN nawa_identities i ON i.issuer=m.issuer AND i.subject=m.subject
+                    JOIN nawa_tenants t ON t.id=m.tenant_id WHERE m.subject=%s''', ('old-user',)).fetchone()
+                after = dict(conn.execute('SELECT name,checksum FROM nawa_schema_migrations').fetchall())
+            self.assertEqual(row[:3], ('reviewer', True, generation))
+            self.assertGreater(row[3], 0)
+            self.assertGreater(row[4], 0)
+            self.assertEqual({name:after[name] for name in before}, before)
+            self.assertIn('006_identity_tenant_generation.sql', after)
+
     def test_operator_grant_and_revoke_invalidates_existing_session(self):
         from nawa_demo.migrate import migrate
         from nawa_demo.identity_repository import membership, membership_by_key
@@ -218,3 +334,4 @@ class IdentityPostgresTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

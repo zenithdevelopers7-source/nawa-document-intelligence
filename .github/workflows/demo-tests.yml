@@ -148,7 +148,9 @@ jobs:
   phase13-local-oidc-integration:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
+    env:
+      NAWA_SYNTHETIC_EVIDENCE: ci
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -157,7 +159,11 @@ jobs:
       - name: Create separate synthetic identity fixture
         run: |
           python -m pip install 'cryptography>=42,<51' 'psycopg[binary]>=3.2,<4' 'playwright==1.56.0' 'PyMuPDF==1.28.2'
-          python -m playwright install --with-deps chromium
+          python -m playwright install chromium
+          if ! python -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(); b.close(); p.stop()"; then
+            python -m playwright install-deps chromium
+            python -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(); b.close(); p.stop()"
+          fi
           cd demo
           python -m nawa_demo.prepare_oidc_fixture --phase 13 --output ../.data/phase13-identity
       - name: Build synthetic Phase 13 QA image

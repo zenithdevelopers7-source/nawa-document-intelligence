@@ -14,6 +14,7 @@ def serve():
     mode = os.environ.get('NAWA_STORAGE', 'memory')
     auth_mode = os.environ.get('NAWA_AUTH', 'demo')
     intake_mode = os.environ.get('NAWA_INTAKE', 'off')
+    evidence_mode = os.environ.get('NAWA_SYNTHETIC_EVIDENCE', 'off')
     bind_port = int(os.environ.get('NAWA_BIND_PORT', '8765'))
     if not 1024 <= bind_port <= 65535:
         raise ValueError('NAWA_BIND_PORT must be an unprivileged TCP port')
@@ -23,6 +24,12 @@ def serve():
         raise ValueError('NAWA_INTAKE must be off or synthetic')
     if intake_mode == 'synthetic' and (auth_mode != 'oidc' or mode != 'postgres'):
         raise ValueError('Synthetic intake requires OIDC and PostgreSQL')
+    if evidence_mode not in ('off', 'ci'):
+        raise ValueError('Invalid synthetic evidence mode')
+    if evidence_mode == 'ci' and (os.environ.get('GITHUB_ACTIONS') != 'true'
+            or os.environ.get('POSTGRES_DB') != 'nawa_phase13_qa_demo'
+            or intake_mode != 'synthetic' or auth_mode != 'oidc' or mode != 'postgres'):
+        raise ValueError('Synthetic evidence requires the disposable CI stack')
     from .scoped_state import validate_correction_source_policy
     correction_policy = validate_correction_source_policy(
         os.environ.get('NAWA_SYNTHETIC_CORRECTION_SOURCE', 'legacy_asserted'))
@@ -90,8 +97,18 @@ def serve():
             intake = build_synthetic_intake(connect, os.environ.get('NAWA_INTAKE_DIR'), origin_policy=origin_policy)
         scoped = ScopedState(connect, correction_source_policy=correction_policy,
                              correction_source_store=intake.store if intake is not None else None)
+        retrieval = None
+        review_queue = None
+        if evidence_mode == 'ci':
+            from .synthetic_live_retrieval import SyntheticLiveRetrieval
+            from .synthetic_postgres_passages import SyntheticPostgresPassages
+            from .synthetic_postgres_review_queue import SyntheticPostgresReviewQueue
+            evidence = SyntheticPostgresPassages(connect, intake.store)
+            retrieval = SyntheticLiveRetrieval(evidence.principal, evidence.passages)
+            review_queue = SyntheticPostgresReviewQueue(retrieval, connect)
         handler = make_protected_handler(scoped, sessions, state, flow=flow,
-                                         allowed_origin=origin, intake=intake)
+                                         allowed_origin=origin, intake=intake, synthetic_retrieval=retrieval,
+                                         synthetic_review_queue=review_queue)
     else:
         raise ValueError('NAWA_AUTH must be demo or oidc')
     with HTTPServer(('0.0.0.0', bind_port), handler) as server:
